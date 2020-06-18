@@ -212,9 +212,6 @@ type decodeState struct {
 	savedError            error
 	useNumber             bool
 	disallowUnknownFields bool
-	// safeUnquote is the number of current string literal bytes that don't
-	// need to be unquoted. When negative, no bytes need unquoting.
-	safeUnquote int
 }
 
 // readIndex returns the position of the last byte read.
@@ -316,27 +313,13 @@ func (d *decodeState) rescanLiteral() {
 Switch:
 	switch data[i-1] {
 	case '"': // string
-		// safeUnquote is initialized at -1, which means that all bytes
-		// checked so far can be unquoted at a later time with no work
-		// at all. When reaching the closing '"', if safeUnquote is
-		// still -1, all bytes can be unquoted with no work. Otherwise,
-		// only those bytes up until the first '\\' or non-ascii rune
-		// can be safely unquoted.
-		safeUnquote := -1
 		for ; i < len(data); i++ {
-			if c := data[i]; c == '\\' {
-				if safeUnquote < 0 { // first unsafe byte
-					safeUnquote = int(i - d.off)
-				}
+			switch data[i] {
+			case '\\':
 				i++ // escaped char
-			} else if c == '"' {
-				d.safeUnquote = safeUnquote
+			case '"':
 				i++ // tokenize the closing quote too
 				break Switch
-			} else if c >= utf8.RuneSelf {
-				if safeUnquote < 0 { // first unsafe byte
-					safeUnquote = int(i - d.off)
-				}
 			}
 		}
 	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-': // number
@@ -677,6 +660,7 @@ func (d *decodeState) object(v reflect.Value) error {
 		return nil
 	}
 
+	var mapElem reflect.Value
 	origErrorContext := d.errorContext
 
 	for {
@@ -694,72 +678,23 @@ func (d *decodeState) object(v reflect.Value) error {
 		start := d.readIndex()
 		d.rescanLiteral()
 		item := d.data[start:d.readIndex()]
-		key, ok := d.unquoteBytes(item)
+		key, ok := unquoteBytes(item)
 		if !ok {
 			panic(phasePanicMsg)
 		}
 
 		// Figure out field corresponding to key.
-		var kv, subv reflect.Value
+		var subv reflect.Value
 		destring := false // whether the value is wrapped in a string to be decoded first
 
 		if v.Kind() == reflect.Map {
-			// First, figure out the key value from the input.
-			kt := t.Key()
-			switch {
-			case reflect.PtrTo(kt).Implements(textUnmarshalerType):
-				kv = reflect.New(kt)
-				if err := d.literalStore(item, kv, true); err != nil {
-					return err
-				}
-				kv = kv.Elem()
-			case kt.Kind() == reflect.String:
-				kv = reflect.ValueOf(key).Convert(kt)
-			default:
-				switch kt.Kind() {
-				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-					s := string(key)
-					n, err := strconv.ParseInt(s, 10, 64)
-					if err != nil || reflect.Zero(kt).OverflowInt(n) {
-						d.saveError(&UnmarshalTypeError{Value: "number " + s, Type: kt, Offset: int64(start + 1)})
-						break
-					}
-					kv = reflect.ValueOf(n).Convert(kt)
-				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-					s := string(key)
-					n, err := strconv.ParseUint(s, 10, 64)
-					if err != nil || reflect.Zero(kt).OverflowUint(n) {
-						d.saveError(&UnmarshalTypeError{Value: "number " + s, Type: kt, Offset: int64(start + 1)})
-						break
-					}
-					kv = reflect.ValueOf(n).Convert(kt)
-				default:
-					panic("json: Unexpected key type") // should never occur
-				}
+			elemType := t.Elem()
+			if !mapElem.IsValid() {
+				mapElem = reflect.New(elemType).Elem()
+			} else {
+				mapElem.Set(reflect.Zero(elemType))
 			}
-
-			// Then, decide what element value we'll decode into.
-			et := t.Elem()
-			if kv.IsValid() {
-				if existing := v.MapIndex(kv); !existing.IsValid() {
-					// Nothing to reuse.
-				} else if et.Kind() == reflect.Ptr {
-					// Pointer; decode directly into it if non-nil.
-					if !existing.IsNil() {
-						subv = existing
-					}
-				} else {
-					// Non-pointer. Make a copy and decode into the
-					// addressable copy. Don't just use a new/zero
-					// value, as that would lose existing data.
-					subv = reflect.New(et).Elem()
-					subv.Set(existing)
-				}
-			}
-			if !subv.IsValid() {
-				// We couldn't reuse an existing value.
-				subv = reflect.New(et).Elem()
-			}
+			subv = mapElem
 		} else {
 			var f *field
 			if i, ok := fields.nameIndex[string(key)]; ok {
@@ -838,8 +773,43 @@ func (d *decodeState) object(v reflect.Value) error {
 
 		// Write value back to map;
 		// if using struct, subv points into struct already.
-		if v.Kind() == reflect.Map && kv.IsValid() {
-			v.SetMapIndex(kv, subv)
+		if v.Kind() == reflect.Map {
+			kt := t.Key()
+			var kv reflect.Value
+			switch {
+			case reflect.PtrTo(kt).Implements(textUnmarshalerType):
+				kv = reflect.New(kt)
+				if err := d.literalStore(item, kv, true); err != nil {
+					return err
+				}
+				kv = kv.Elem()
+			case kt.Kind() == reflect.String:
+				kv = reflect.ValueOf(key).Convert(kt)
+			default:
+				switch kt.Kind() {
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					s := string(key)
+					n, err := strconv.ParseInt(s, 10, 64)
+					if err != nil || reflect.Zero(kt).OverflowInt(n) {
+						d.saveError(&UnmarshalTypeError{Value: "number " + s, Type: kt, Offset: int64(start + 1)})
+						break
+					}
+					kv = reflect.ValueOf(n).Convert(kt)
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+					s := string(key)
+					n, err := strconv.ParseUint(s, 10, 64)
+					if err != nil || reflect.Zero(kt).OverflowUint(n) {
+						d.saveError(&UnmarshalTypeError{Value: "number " + s, Type: kt, Offset: int64(start + 1)})
+						break
+					}
+					kv = reflect.ValueOf(n).Convert(kt)
+				default:
+					panic("json: Unexpected key type") // should never occur
+				}
+			}
+			if kv.IsValid() {
+				v.SetMapIndex(kv, subv)
+			}
 		}
 
 		// Next token must be , or }.
@@ -909,7 +879,7 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 			d.saveError(&UnmarshalTypeError{Value: val, Type: v.Type(), Offset: int64(d.readIndex())})
 			return nil
 		}
-		s, ok := d.unquoteBytes(item)
+		s, ok := unquoteBytes(item)
 		if !ok {
 			if fromQuoted {
 				return fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type())
@@ -960,7 +930,7 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 		}
 
 	case '"': // string
-		s, ok := d.unquoteBytes(item)
+		s, ok := unquoteBytes(item)
 		if !ok {
 			if fromQuoted {
 				return fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type())
@@ -1120,7 +1090,7 @@ func (d *decodeState) objectInterface() map[string]interface{} {
 		start := d.readIndex()
 		d.rescanLiteral()
 		item := d.data[start:d.readIndex()]
-		key, ok := d.unquote(item)
+		key, ok := unquote(item)
 		if !ok {
 			panic(phasePanicMsg)
 		}
@@ -1169,7 +1139,7 @@ func (d *decodeState) literalInterface() interface{} {
 		return c == 't'
 
 	case '"': // string
-		s, ok := d.unquote(item)
+		s, ok := unquote(item)
 		if !ok {
 			panic(phasePanicMsg)
 		}
@@ -1212,33 +1182,40 @@ func getu4(s []byte) rune {
 
 // unquote converts a quoted JSON string literal s into an actual string t.
 // The rules are different than for Go, so cannot use strconv.Unquote.
-// The first byte in s must be '"'.
-func (d *decodeState) unquote(s []byte) (t string, ok bool) {
-	s, ok = d.unquoteBytes(s)
+func unquote(s []byte) (t string, ok bool) {
+	s, ok = unquoteBytes(s)
 	t = string(s)
 	return
 }
 
-func (d *decodeState) unquoteBytes(s []byte) (t []byte, ok bool) {
-	// We already know that s[0] == '"'. However, we don't know that the
-	// closing quote exists in all cases, such as when the string is nested
-	// via the ",string" option.
-	if len(s) < 2 || s[len(s)-1] != '"' {
+func unquoteBytes(s []byte) (t []byte, ok bool) {
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
 		return
 	}
 	s = s[1 : len(s)-1]
 
-	// If there are no unusual characters, no unquoting is needed, so return
-	// a slice of the original bytes.
-	r := d.safeUnquote
-	if r == -1 {
+	// Check for unusual characters. If there are none,
+	// then no unquoting is needed, so return a slice of the
+	// original bytes.
+	r := 0
+	for r < len(s) {
+		c := s[r]
+		if c == '\\' || c == '"' || c < ' ' {
+			break
+		}
+		if c < utf8.RuneSelf {
+			r++
+			continue
+		}
+		rr, size := utf8.DecodeRune(s[r:])
+		if rr == utf8.RuneError && size == 1 {
+			break
+		}
+		r += size
+	}
+	if r == len(s) {
 		return s, true
 	}
-	// Only perform up to one safe unquote for each re-scanned string
-	// literal. In some edge cases, the decoder unquotes a literal a second
-	// time, even after another literal has been re-scanned. Thus, only the
-	// first unquote can safely use safeUnquote.
-	d.safeUnquote = 0
 
 	b := make([]byte, len(s)+2*utf8.UTFMax)
 	w := copy(b, s[0:r])
